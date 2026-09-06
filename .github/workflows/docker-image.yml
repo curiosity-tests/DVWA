@@ -1,16 +1,74 @@
 name: Docker Image CI
 
+# racecar fork-testbed patch. Changes from upstream:
+#   1. workflow_dispatch gains leg/profile/racecar_run inputs so racecar can
+#      drive the run and pick baseline vs instrumented. Upstream already had a
+#      bare workflow_dispatch, so no trigger was added.
+#   2. actions/checkout -> crashappsec/action-checkout, which wraps checkout and
+#      setup-chalk-action; `chalk:` is the only variable separating the arms.
+#   3. permissions: id-token: write for the action's OIDC connect. Declaring the
+#      block zeroes every unlisted scope, so the rest is restated.
+#   4. A fail-closed assertion on the instrumented arm.
+#   5. The image is BUILT but not PUSHED. Upstream publishes to
+#      ghcr.io/<owner>/dvwa; from this fork that would publish under
+#      curiosity-tests, and a testbed must not publish. The ghcr login step is
+#      dropped and `--push` removed with it. Both platforms are still built, so
+#      the measured build work is unchanged -- only the upload is gone.
+#   6. the concurrency group carries the leg, so dispatching the second arm does
+#      not cancel the first. Cancellation-only, never a build change.
+
+run-name: "Docker Image CI ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
+
 on:
   workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   push:
     branches:
       - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CHALK_ON: ${{ inputs.leg == 'instrumented' }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6.0.2
+    - uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+
+    - name: Assert instrumentation is live
+      # Socket existence, not LD_PRELOAD: co-monitor's loader clears
+      # LD_PRELOAD once it has injected, so an empty value is what success
+      # looks like. co-hostd also daemonizes, so pgrep does not match it.
+      if: env.CHALK_ON == 'true'
+      run: |
+        test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+        test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v3
@@ -18,14 +76,7 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v3
 
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    - name : Build and push multi-arch DVWA image
+    - name : Build multi-arch DVWA image
       run: |
 
         IMAGE_ID=ghcr.io/${{ github.repository_owner }}/dvwa
@@ -41,5 +92,4 @@ jobs:
         docker buildx build --platform linux/amd64,linux/arm64 \
               --tag $IMAGE_ID:$VERSION \
               --tag $IMAGE_ID:$COMMIT \
-              --push .
-
+              .
